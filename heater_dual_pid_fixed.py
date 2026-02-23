@@ -323,11 +323,23 @@ class AdaptivePIDNN:
 
     def update(self, current_value, setpoint, dt):
         error = setpoint - current_value
+
+        # Leaky integrator reduces long-memory lock-in after large overshoot events.
+        self.integral *= 0.999
         self.integral += error * dt
         self.integral = float(np.clip(self.integral, -self.integral_clip, self.integral_clip))
-        derivative = (error - self.last_error) / dt if dt > 0.0 else 0.0
 
+        derivative = (error - self.last_error) / dt if dt > 0.0 else 0.0
         u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+
+        # Sign-consistent anti-windup: if control action fights the current error,
+        # bleed integral in the opposite direction and recompute u.
+        if error > 0.0 and u < 0.0:
+            self.integral = max(self.integral, 0.0)
+            u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        elif error < 0.0 and u > 0.0:
+            self.integral = min(self.integral, 0.0)
+            u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
 
         abs_e = abs(error)
         abs_last_e = abs(self.last_error)
@@ -367,6 +379,7 @@ def allocate_min_power(Ppre_cmd, Pmain_cmd, e2, e3, losses_pre, losses_main, dea
     - Prioritize main-heater power for RTD3 tracking.
     - Disable preheater unless both sections are cold and RTD3 still needs heat.
     - In the near-setpoint region, only apply loss-compensation power.
+    - Enforce minimum RTD3 recovery power when RTD3 is far below setpoint.
     """
     # Any RTD3 overshoot: stop active heating to avoid oscillatory re-heating.
     if e3 < -deadband_K:
@@ -378,6 +391,12 @@ def allocate_min_power(Ppre_cmd, Pmain_cmd, e2, e3, losses_pre, losses_main, dea
     # Near setpoint: only hold estimated thermal losses.
     if abs(e3) <= 2.0 * deadband_K and abs(e2) <= 2.0 * deadband_K:
         return float(np.clip(losses_pre, 0.0, q_max)), float(np.clip(losses_main, 0.0, q_max))
+
+    # Guarantee a non-zero recovery action for RTD3 when far below target,
+    # even if PID raw output briefly goes negative due to integral history.
+    if e3 > 3.0 * deadband_K:
+        min_recovery = max(0.10 * q_max, losses_main)
+        Pmain = max(Pmain, min_recovery)
 
     # RTD3 gets primary authority; preheater acts only as assist when both are cold.
     if not (e3 > 2.0 * deadband_K and e2 > deadband_K):
