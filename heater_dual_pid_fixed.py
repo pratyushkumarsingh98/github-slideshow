@@ -43,12 +43,24 @@ def pwm_gate(t, duty, period):
     return 1.0 if phase < duty else 0.0
 
 
+def low_pass_setpoint(prev_sp, target_sp, dt, tau_s):
+    alpha = float(np.clip(dt / max(tau_s, 1e-6), 0.0, 1.0))
+    return prev_sp + alpha * (target_sp - prev_sp)
+
+
+def rate_limit(prev_cmd, cmd_target, slew_rate_w_per_s, dt):
+    delta_max = max(slew_rate_w_per_s, 0.0) * max(dt, 0.0)
+    return float(np.clip(cmd_target, prev_cmd - delta_max, prev_cmd + delta_max))
+
+
 # =============================================================================
 # USER SWITCHES
 # =============================================================================
 FIXED_DT = 0.01
 SUPERVISOR_ON = True
 PRINT_EVERY = 20
+SP_FILTER_TAU = 1.5            # [s] setpoint prefilter time constant
+CMD_RATE_LIMIT_W_PER_S = 4.0   # [W/s] command slew-rate limit
 
 # =============================================================================
 # DISCRETIZATION / RUNTIME
@@ -374,31 +386,31 @@ def supervisor(Ppre_cmd, Pmain_cmd, e2, e3, deadband_K=1.0, scale_min=0.3):
 
 
 def allocate_min_power(Ppre_cmd, Pmain_cmd, e2, e3, losses_pre, losses_main, deadband_K=1.0):
-    """Energy-aware allocator.
+    """Energy-aware allocator with anti-lockout behavior.
 
-    - Prioritize main-heater power for RTD3 tracking.
-    - Disable preheater unless both sections are cold and RTD3 still needs heat.
-    - In the near-setpoint region, only apply loss-compensation power.
-    - Enforce minimum RTD3 recovery power when RTD3 is far below setpoint.
+    - Main heater owns RTD3 tracking.
+    - During RTD3 overshoot, main heater is forced OFF, while preheater may still
+      provide limited recovery when RTD2 is below target.
+    - Near setpoint, commands collapse to estimated loss-compensation levels.
     """
-    # Any RTD3 overshoot: stop active heating to avoid oscillatory re-heating.
-    if e3 < -deadband_K:
-        return 0.0, 0.0
-
     Ppre = max(Ppre_cmd, 0.0)
     Pmain = max(Pmain_cmd, 0.0)
 
-    # Near setpoint: only hold estimated thermal losses.
+    # Near both setpoints -> hold only loss compensation.
     if abs(e3) <= 2.0 * deadband_K and abs(e2) <= 2.0 * deadband_K:
         return float(np.clip(losses_pre, 0.0, q_max)), float(np.clip(losses_main, 0.0, q_max))
 
-    # Guarantee a non-zero recovery action for RTD3 when far below target,
-    # even if PID raw output briefly goes negative due to integral history.
+    # RTD3 overshoot: shut main heater down but allow mild RTD2 recovery if needed.
+    if e3 < -deadband_K:
+        pre_recovery = max(Ppre, losses_pre) if e2 > deadband_K else 0.0
+        return float(np.clip(pre_recovery, 0.0, q_max)), 0.0
+
+    # RTD3 undershoot: enforce non-zero main recovery action.
     if e3 > 3.0 * deadband_K:
         min_recovery = max(0.10 * q_max, losses_main)
         Pmain = max(Pmain, min_recovery)
 
-    # RTD3 gets primary authority; preheater acts only as assist when both are cold.
+    # Preheater assists only when both zones are below target.
     if not (e3 > 2.0 * deadband_K and e2 > deadband_K):
         Ppre = 0.0
 
@@ -568,6 +580,8 @@ def main():
     Tw3_hist = np.zeros(n_steps)
     SP2_hist = np.zeros(n_steps)
     SP3_hist = np.zeros(n_steps)
+    SP2_f_hist = np.zeros(n_steps)
+    SP3_f_hist = np.zeros(n_steps)
 
     u2_raw = np.zeros(n_steps)
     u3_raw = np.zeros(n_steps)
@@ -590,6 +604,11 @@ def main():
     noz_mdot_act = np.zeros(n_steps)
     noz_ue = np.zeros(n_steps)
     noz_eta_u = np.zeros(n_steps)
+
+    SP2_f = float(setpoint_rtd2(0.0))
+    SP3_f = float(setpoint_rtd3(0.0))
+    Ppre_cmd_prev = 0.0
+    Pmain_cmd_prev = 0.0
 
     for k in tqdm(range(1, n_steps), desc="Simulating", dynamic_ncols=True):
         t = k * FIXED_DT
@@ -643,14 +662,18 @@ def main():
 
         SP2 = float(setpoint_rtd2(t))
         SP3 = float(setpoint_rtd3(t))
+        SP2_f = low_pass_setpoint(SP2_f, SP2, FIXED_DT, SP_FILTER_TAU)
+        SP3_f = low_pass_setpoint(SP3_f, SP3, FIXED_DT, SP_FILTER_TAU)
         SP2_hist[k] = SP2
         SP3_hist[k] = SP3
+        SP2_f_hist[k] = SP2_f
+        SP3_f_hist[k] = SP3_f
 
-        e2 = SP2 - T2
-        e3 = SP3 - T3
+        e2 = SP2_f - T2
+        e3 = SP3_f - T3
 
-        u2 = float(pid2.update(T2, SP2, FIXED_DT))
-        u3 = float(pid3.update(T3, SP3, FIXED_DT))
+        u2 = float(pid2.update(T2, SP2_f, FIXED_DT))
+        u3 = float(pid3.update(T3, SP3_f, FIXED_DT))
         u2_raw[k] = u2
         u3_raw[k] = u3
 
@@ -700,6 +723,11 @@ def main():
             losses_main,
             deadband_K=deadband,
         )
+
+        Ppre_cmd_next = rate_limit(Ppre_cmd_prev, Ppre_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
+        Pmain_cmd_next = rate_limit(Pmain_cmd_prev, Pmain_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
+        Ppre_cmd_prev = Ppre_cmd_next
+        Pmain_cmd_prev = Pmain_cmd_next
 
         Ppre_applied_hist[k] = Ppre_applied
         Pmain_applied_hist[k] = Pmain_applied
@@ -771,8 +799,8 @@ def main():
 
         fig.tight_layout()
 
-    plot_heater_panel("RTD2", T2_hist, Tw2_hist, SP2_hist, Ppre_applied_hist, kp2_hist, ki2_hist, kd2_hist)
-    plot_heater_panel("RTD3", T3_hist, Tw3_hist, SP3_hist, Pmain_applied_hist, kp3_hist, ki3_hist, kd3_hist)
+    plot_heater_panel("RTD2", T2_hist, Tw2_hist, SP2_f_hist, Ppre_applied_hist, kp2_hist, ki2_hist, kd2_hist)
+    plot_heater_panel("RTD3", T3_hist, Tw3_hist, SP3_f_hist, Pmain_applied_hist, kp3_hist, ki3_hist, kd3_hist)
 
     plt.figure(figsize=(14, 10))
 
