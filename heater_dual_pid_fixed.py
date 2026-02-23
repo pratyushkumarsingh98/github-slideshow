@@ -24,7 +24,7 @@ EPS = 1e-30  # tiny number to prevent division-by-zero
 # =========================
 # PWM / Duty-cycle actuation (paper-like power spikes)
 # =========================
-PWM_ON = True
+PWM_ON = False
 PWM_PERIOD = 0.50
 P_MAX_PRE = None
 P_MAX_MAIN = None
@@ -190,8 +190,6 @@ def nozzle_metrics(T0, P0, x_vap, specie="Water"):
 
 q_max = 20.0
 deadband = 1.0
-POWER_SPLIT_PRE = 0.5
-POWER_SPLIT_MAIN = 0.5
 
 
 # =============================================================================
@@ -361,6 +359,31 @@ def supervisor(Ppre_cmd, Pmain_cmd, e2, e3, deadband_K=1.0, scale_min=0.3):
     if abs(e2) < deadband_K and abs(e3) < deadband_K:
         return max(Ppre_cmd * scale_min, 0.0), max(Pmain_cmd * scale_min, 0.0)
     return Ppre_cmd, Pmain_cmd
+
+
+def allocate_min_power(Ppre_cmd, Pmain_cmd, e2, e3, losses_pre, losses_main, deadband_K=1.0):
+    """Energy-aware allocator.
+
+    - Prioritize main-heater power for RTD3 tracking.
+    - Disable preheater unless both sections are cold and RTD3 still needs heat.
+    - In the near-setpoint region, only apply loss-compensation power.
+    """
+    # Any RTD3 overshoot: stop active heating to avoid oscillatory re-heating.
+    if e3 < -deadband_K:
+        return 0.0, 0.0
+
+    Ppre = max(Ppre_cmd, 0.0)
+    Pmain = max(Pmain_cmd, 0.0)
+
+    # Near setpoint: only hold estimated thermal losses.
+    if abs(e3) <= 2.0 * deadband_K and abs(e2) <= 2.0 * deadband_K:
+        return float(np.clip(losses_pre, 0.0, q_max)), float(np.clip(losses_main, 0.0, q_max))
+
+    # RTD3 gets primary authority; preheater acts only as assist when both are cold.
+    if not (e3 > 2.0 * deadband_K and e2 > deadband_K):
+        Ppre = 0.0
+
+    return float(np.clip(Ppre, 0.0, q_max)), float(np.clip(Pmain, 0.0, q_max))
 
 
 # =============================================================================
@@ -649,12 +672,15 @@ def main():
         Pmain_cmd_next = d_main_cmd_next * float(q_max)
 
         Ppre_cmd_next, Pmain_cmd_next = supervisor(Ppre_cmd_next, Pmain_cmd_next, e2, e3)
-
-        # Enforce fixed total-power split between preheater and main heater.
-        # This applies your requested 50/50 split policy.
-        P_total_cmd_next = Ppre_cmd_next + Pmain_cmd_next
-        Ppre_cmd_next = POWER_SPLIT_PRE * P_total_cmd_next
-        Pmain_cmd_next = POWER_SPLIT_MAIN * P_total_cmd_next
+        Ppre_cmd_next, Pmain_cmd_next = allocate_min_power(
+            Ppre_cmd_next,
+            Pmain_cmd_next,
+            e2,
+            e3,
+            losses_pre,
+            losses_main,
+            deadband_K=deadband,
+        )
 
         Ppre_applied_hist[k] = Ppre_applied
         Pmain_applied_hist[k] = Pmain_applied
