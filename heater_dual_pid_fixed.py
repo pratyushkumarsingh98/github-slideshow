@@ -24,7 +24,7 @@ EPS = 1e-30  # tiny number to prevent division-by-zero
 # =========================
 # PWM / Duty-cycle actuation (paper-like power spikes)
 # =========================
-PWM_ON = False
+PWM_ON = True
 PWM_PERIOD = 0.50
 P_MAX_PRE = None
 P_MAX_MAIN = None
