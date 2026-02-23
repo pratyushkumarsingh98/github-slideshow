@@ -60,10 +60,13 @@ def rate_limit(prev_cmd, cmd_target, slew_rate_w_per_s, dt):
 # USER SWITCHES
 # =============================================================================
 FIXED_DT = 0.01
-SUPERVISOR_ON = True
+SUPERVISOR_ON = False
 PRINT_EVERY = 20
 SP_FILTER_TAU = 1.5            # [s] setpoint prefilter time constant
 CMD_RATE_LIMIT_W_PER_S = 4.0   # [W/s] command slew-rate limit
+USE_ALLOCATOR = False          # baseline mode: keep PID authority
+USE_ANTICIPATORY_CUTOFF = False
+USE_HARD_CUTOFF = True
 OVERSHOOT_GUARD_HORIZON_S = 0.25  # [s] predictive cutoff horizon
 PREHEAT_HARD_CUTOFF_K = 0.5  # [K] force preheater OFF above filtered setpoint
 MAIN_HARD_CUTOFF_K = 0.5     # [K] force main heater OFF above filtered setpoint
@@ -337,6 +340,7 @@ class AdaptivePIDNN:
         adapt_rate_d=0.05,
         big_error_threshold=5.0,
         integral_clip=1e6,
+        u_max=1.0,
     ):
         self.kp0 = kp0
         self.ki0 = ki0
@@ -348,6 +352,7 @@ class AdaptivePIDNN:
         self.adapt_rate_i = adapt_rate_i
         self.adapt_rate_d = adapt_rate_d
         self.big_error_threshold = big_error_threshold
+        self.u_max = u_max
         self.integral = 0.0
         self.last_error = 0.0
         self.integral_clip = float(integral_clip)
@@ -355,32 +360,32 @@ class AdaptivePIDNN:
     def update(self, current_value, setpoint, dt):
         error = setpoint - current_value
 
-        # Leaky integrator reduces long-memory lock-in after large overshoot events.
-        self.integral *= 0.999
-        self.integral += error * dt
+        # Heating-only integration policy from the December script:
+        # accumulate when below setpoint, quickly decay when above.
+        if error > 0.0:
+            self.integral += error * dt
+        else:
+            self.integral *= max(0.0, 1.0 - 5.0 * dt)
         self.integral = float(np.clip(self.integral, -self.integral_clip, self.integral_clip))
 
         derivative = (error - self.last_error) / dt if dt > 0.0 else 0.0
         u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
 
-        # Sign-consistent anti-windup: if control action fights the current error,
-        # bleed integral in the opposite direction and recompute u.
-        if error > 0.0 and u < 0.0:
-            self.integral = max(self.integral, 0.0)
-            u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
-        elif error < 0.0 and u > 0.0:
-            self.integral = min(self.integral, 0.0)
-            u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        # Heating actuator cannot command negative duty.
+        u = max(u, 0.0)
+        if self.u_max is not None:
+            u = min(u, self.u_max)
 
         abs_e = abs(error)
         abs_last_e = abs(self.last_error)
         big_err = self.big_error_threshold
 
-        if abs_e > big_err and abs_e >= abs_last_e:
+        if (error > 0.0) and (abs_e > big_err) and (abs_e >= abs_last_e):
             self.kp *= 1.0 + self.adapt_rate_p * dt
             self.ki *= 1.0 + self.adapt_rate_i * dt
 
-        if np.sign(error) != np.sign(self.last_error) and abs_last_e > big_err:
+        overshoot = (error < 0.0) and (abs_e > 0.5)
+        if overshoot and abs_last_e > big_err:
             self.kp *= 1.0 - self.adapt_rate_p * dt
             self.ki *= 1.0 - self.adapt_rate_i * dt
             self.kd *= 1.0 + self.adapt_rate_d * dt
@@ -587,8 +592,8 @@ def main():
     A_pre = A_ext * frac_pre
     A_main = A_ext * frac_main
 
-    pid2 = AdaptivePIDNN()
-    pid3 = AdaptivePIDNN()
+    pid2 = AdaptivePIDNN(u_max=1.0)
+    pid3 = AdaptivePIDNN(u_max=1.0)
 
     Ppre_applied = 0.0
     Pmain_applied = 0.0
@@ -741,34 +746,39 @@ def main():
         Ppre_cmd_next = d_pre_cmd_next * float(q_max)
         Pmain_cmd_next = d_main_cmd_next * float(q_max)
 
-        Ppre_cmd_next, Pmain_cmd_next = supervisor(Ppre_cmd_next, Pmain_cmd_next, e2, e3)
-        Ppre_cmd_next, Pmain_cmd_next = allocate_min_power(
-            Ppre_cmd_next,
-            Pmain_cmd_next,
-            e2,
-            e3,
-            losses_pre,
-            losses_main,
-            deadband_K=deadband,
-        )
+        if SUPERVISOR_ON:
+            Ppre_cmd_next, Pmain_cmd_next = supervisor(Ppre_cmd_next, Pmain_cmd_next, e2, e3)
 
-        Ppre_cmd_next, Pmain_cmd_next = apply_anticipatory_cutoff(
-            Ppre_cmd_next,
-            Pmain_cmd_next,
-            T2,
-            T3,
-            SP2_f,
-            SP3_f,
-            dT2_dt,
-            dT3_dt,
-            OVERSHOOT_GUARD_HORIZON_S,
-        )
+        if USE_ALLOCATOR:
+            Ppre_cmd_next, Pmain_cmd_next = allocate_min_power(
+                Ppre_cmd_next,
+                Pmain_cmd_next,
+                e2,
+                e3,
+                losses_pre,
+                losses_main,
+                deadband_K=deadband,
+            )
 
-        # Hard thermal safety cutoff: never keep heating when node is above filtered target.
-        if T2 >= (SP2_f + PREHEAT_HARD_CUTOFF_K):
-            Ppre_cmd_next = 0.0
-        if T3 >= (SP3_f + MAIN_HARD_CUTOFF_K):
-            Pmain_cmd_next = 0.0
+        if USE_ANTICIPATORY_CUTOFF:
+            Ppre_cmd_next, Pmain_cmd_next = apply_anticipatory_cutoff(
+                Ppre_cmd_next,
+                Pmain_cmd_next,
+                T2,
+                T3,
+                SP2_f,
+                SP3_f,
+                dT2_dt,
+                dT3_dt,
+                OVERSHOOT_GUARD_HORIZON_S,
+            )
+
+        if USE_HARD_CUTOFF:
+            # Hard thermal safety cutoff: never keep heating when node is above filtered target.
+            if T2 >= (SP2_f + PREHEAT_HARD_CUTOFF_K):
+                Ppre_cmd_next = 0.0
+            if T3 >= (SP3_f + MAIN_HARD_CUTOFF_K):
+                Pmain_cmd_next = 0.0
 
         Ppre_cmd_next = rate_limit(Ppre_cmd_prev, Ppre_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
         Pmain_cmd_next = rate_limit(Pmain_cmd_prev, Pmain_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
