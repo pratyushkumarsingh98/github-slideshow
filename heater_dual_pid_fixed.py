@@ -25,7 +25,7 @@ EPS = 1e-30  # tiny number to prevent division-by-zero
 # PWM / Duty-cycle actuation (paper-like power spikes)
 # =========================
 PWM_ON = True
-PWM_PERIOD = 0.50
+PWM_PERIOD = 0.05
 P_MAX_PRE = None
 P_MAX_MAIN = None
 
@@ -61,6 +61,7 @@ SUPERVISOR_ON = True
 PRINT_EVERY = 20
 SP_FILTER_TAU = 1.5            # [s] setpoint prefilter time constant
 CMD_RATE_LIMIT_W_PER_S = 4.0   # [W/s] command slew-rate limit
+OVERSHOOT_GUARD_HORIZON_S = 0.25  # [s] predictive cutoff horizon
 
 # =============================================================================
 # DISCRETIZATION / RUNTIME
@@ -387,6 +388,19 @@ class AdaptivePIDNN:
         return float(u)
 
 
+def apply_anticipatory_cutoff(Ppre_cmd, Pmain_cmd, T2, T3, SP2, SP3, dT2_dt, dT3_dt, horizon_s):
+    """Reduce heater commands when projected temperature exceeds filtered setpoint."""
+    T2_proj = T2 + max(dT2_dt, 0.0) * max(horizon_s, 0.0)
+    T3_proj = T3 + max(dT3_dt, 0.0) * max(horizon_s, 0.0)
+
+    if T3_proj >= SP3:
+        Pmain_cmd = 0.0
+    if T2_proj >= SP2:
+        Ppre_cmd = 0.0
+
+    return float(max(Ppre_cmd, 0.0)), float(max(Pmain_cmd, 0.0))
+
+
 # =============================================================================
 # SUPERVISOR
 # =============================================================================
@@ -645,6 +659,10 @@ def main():
         T3 = float(T_fl[rtd3])
         Tw3 = float(T_wall[rtd3])
 
+        prev_idx = max(k - 1, 0)
+        dT2_dt = (T2 - T2_hist[prev_idx]) / FIXED_DT if k > 1 else 0.0
+        dT3_dt = (T3 - T3_hist[prev_idx]) / FIXED_DT if k > 1 else 0.0
+
         T0 = float(T3)
         P0 = float(p[rtd3])
         x_exit_raw = quality_from_hP(float(h[rtd3]), float(p[rtd3]), specie=specie, clip=False)
@@ -727,6 +745,18 @@ def main():
             losses_pre,
             losses_main,
             deadband_K=deadband,
+        )
+
+        Ppre_cmd_next, Pmain_cmd_next = apply_anticipatory_cutoff(
+            Ppre_cmd_next,
+            Pmain_cmd_next,
+            T2,
+            T3,
+            SP2_f,
+            SP3_f,
+            dT2_dt,
+            dT3_dt,
+            OVERSHOOT_GUARD_HORIZON_S,
         )
 
         Ppre_cmd_next = rate_limit(Ppre_cmd_prev, Ppre_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
