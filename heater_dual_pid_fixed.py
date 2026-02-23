@@ -49,8 +49,11 @@ def low_pass_setpoint(prev_sp, target_sp, dt, tau_s):
 
 
 def rate_limit(prev_cmd, cmd_target, slew_rate_w_per_s, dt):
+    """Rate-limit command increase, but allow immediate decreases for safety."""
+    if cmd_target <= prev_cmd:
+        return float(max(cmd_target, 0.0))
     delta_max = max(slew_rate_w_per_s, 0.0) * max(dt, 0.0)
-    return float(np.clip(cmd_target, prev_cmd - delta_max, prev_cmd + delta_max))
+    return float(min(cmd_target, prev_cmd + delta_max))
 
 
 # =============================================================================
@@ -62,6 +65,8 @@ PRINT_EVERY = 20
 SP_FILTER_TAU = 1.5            # [s] setpoint prefilter time constant
 CMD_RATE_LIMIT_W_PER_S = 4.0   # [W/s] command slew-rate limit
 OVERSHOOT_GUARD_HORIZON_S = 0.25  # [s] predictive cutoff horizon
+PREHEAT_HARD_CUTOFF_K = 0.5  # [K] force preheater OFF above filtered setpoint
+MAIN_HARD_CUTOFF_K = 0.5     # [K] force main heater OFF above filtered setpoint
 
 # =============================================================================
 # DISCRETIZATION / RUNTIME
@@ -758,6 +763,12 @@ def main():
             dT3_dt,
             OVERSHOOT_GUARD_HORIZON_S,
         )
+
+        # Hard thermal safety cutoff: never keep heating when node is above filtered target.
+        if T2 >= (SP2_f + PREHEAT_HARD_CUTOFF_K):
+            Ppre_cmd_next = 0.0
+        if T3 >= (SP3_f + MAIN_HARD_CUTOFF_K):
+            Pmain_cmd_next = 0.0
 
         Ppre_cmd_next = rate_limit(Ppre_cmd_prev, Ppre_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
         Pmain_cmd_next = rate_limit(Pmain_cmd_prev, Pmain_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
