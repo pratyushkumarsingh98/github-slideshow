@@ -277,6 +277,19 @@ def calculation_P_conv(h_conv, T_wall, T_amb, A_ext_local):
     return h_conv * A_ext_local * (T_wall - T_amb)
 
 
+def robust_temperature_from_ph(p_val, h_val, specie):
+    """Return temperature from (p,h) with minimal state distortion on fallback."""
+    p_use = float(max(p_val, 1e3))
+    try:
+        return float(CP.PropsSI("T", "P", p_use, "H", h_val, specie))
+    except Exception:
+        hL = CP.PropsSI("H", "P", p_use, "Q", 0, specie)
+        hV = CP.PropsSI("H", "P", p_use, "Q", 1, specie)
+        # Narrow fallback band to reduce state pinning/plateau artifacts.
+        h_eval = float(np.clip(h_val, hL - 8e4, hV + 8e4))
+        return float(CP.PropsSI("T", "P", p_use, "H", h_eval, specie))
+
+
 # =============================================================================
 # SETPOINTS — Option B (stepwise)
 # =============================================================================
@@ -468,17 +481,16 @@ def plant_step_transient(
     for i in range(1, n):
         p_i = float(max(p[i], 1e3))
 
-        try:
-            T_i = CP.PropsSI("T", "P", p_i, "H", h[i], specie)
-        except Exception:
-            hL = CP.PropsSI("H", "P", p_i, "Q", 0, specie)
-            hV = CP.PropsSI("H", "P", p_i, "Q", 1, specie)
-            h[i] = float(np.clip(h[i], hL - 2e5, hV + 2e5))
-            T_i = CP.PropsSI("T", "P", p_i, "H", h[i], specie)
+        T_i = robust_temperature_from_ph(p_i, h[i], specie)
 
-        rho = CP.PropsSI("D", "P", p_i, "H", h[i], specie)
+        # Use a bounded local enthalpy only for property evaluation; do not
+        # overwrite the transported state directly to avoid artificial plateaus.
+        hL_loc = CP.PropsSI("H", "P", p_i, "Q", 0, specie)
+        hV_loc = CP.PropsSI("H", "P", p_i, "Q", 1, specie)
+        h_eval = float(np.clip(h[i], hL_loc - 8e4, hV_loc + 8e4))
+        rho = CP.PropsSI("D", "P", p_i, "H", h_eval, specie)
 
-        phase = CP.PhaseSI("P", p_i, "HMASS", h[i], specie)
+        phase = CP.PhaseSI("P", p_i, "HMASS", h_eval, specie)
         phase_l = phase.lower()
         if "liquid" in phase_l and "twophase" not in phase_l:
             x_v = 0.0
@@ -518,14 +530,7 @@ def plant_step_transient(
         else:
             qflux = 0.0
 
-        try:
-            T_new = CP.PropsSI("T", "P", p_new[i], "H", h_new[i], specie)
-        except Exception:
-            p_tmp = float(max(p_new[i], 1e3))
-            hL2 = CP.PropsSI("H", "P", p_tmp, "Q", 0, specie)
-            hV2 = CP.PropsSI("H", "P", p_tmp, "Q", 1, specie)
-            h_new[i] = float(np.clip(h_new[i], hL2 - 2e5, hV2 + 2e5))
-            T_new = CP.PropsSI("T", "P", p_tmp, "H", h_new[i], specie)
+        T_new = robust_temperature_from_ph(p_new[i], h_new[i], specie)
 
         T_fl[i] = float(T_new)
         T_w[i] = qflux / (hc + EPS) + float(T_new)
