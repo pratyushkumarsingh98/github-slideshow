@@ -190,6 +190,8 @@ def nozzle_metrics(T0, P0, x_vap, specie="Water"):
 
 q_max = 20.0
 deadband = 1.0
+POWER_SPLIT_PRE = 0.5
+POWER_SPLIT_MAIN = 0.5
 
 
 # =============================================================================
@@ -647,6 +649,12 @@ def main():
         Pmain_cmd_next = d_main_cmd_next * float(q_max)
 
         Ppre_cmd_next, Pmain_cmd_next = supervisor(Ppre_cmd_next, Pmain_cmd_next, e2, e3)
+
+        # Enforce fixed total-power split between preheater and main heater.
+        # This applies your requested 50/50 split policy.
+        P_total_cmd_next = Ppre_cmd_next + Pmain_cmd_next
+        Ppre_cmd_next = POWER_SPLIT_PRE * P_total_cmd_next
+        Pmain_cmd_next = POWER_SPLIT_MAIN * P_total_cmd_next
 
         Ppre_applied_hist[k] = Ppre_applied
         Pmain_applied_hist[k] = Pmain_applied
