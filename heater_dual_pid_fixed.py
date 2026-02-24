@@ -61,13 +61,14 @@ def rate_limit(prev_cmd, cmd_target, slew_rate_w_per_s, dt):
 # =============================================================================
 FIXED_DT = 0.01
 SUPERVISOR_ON = False
-PRINT_EVERY = 20
+PRINT_EVERY = 100
 SP_FILTER_TAU = 1.5            # [s] setpoint prefilter time constant
 CMD_RATE_LIMIT_W_PER_S = 4.0   # [W/s] command slew-rate limit
 USE_ALLOCATOR = False          # baseline mode: keep PID authority
 USE_ANTICIPATORY_CUTOFF = False
 USE_HARD_CUTOFF = True
 OVERSHOOT_GUARD_HORIZON_S = 0.25  # [s] predictive cutoff horizon
+NOZZLE_DIAGNOSTICS_EVERY = 10  # compute expensive nozzle metrics every N steps (1 = every step)
 PREHEAT_HARD_CUTOFF_K = 0.5  # [K] force preheater OFF above filtered setpoint
 MAIN_HARD_CUTOFF_K = 0.5     # [K] force main heater OFF above filtered setpoint
 
@@ -678,7 +679,12 @@ def main():
         x_exit_raw = quality_from_hP(float(h[rtd3]), float(p[rtd3]), specie=specie, clip=False)
         x_exit_clip = quality_from_hP(float(h[rtd3]), float(p[rtd3]), specie=specie, clip=True)
 
-        m_dot_act, u_e, eta_u = nozzle_metrics(T0, P0, x_exit_clip, specie=specie)
+        if (k % max(NOZZLE_DIAGNOSTICS_EVERY, 1)) == 0 or k == 1:
+            m_dot_act, u_e, eta_u = nozzle_metrics(T0, P0, x_exit_clip, specie=specie)
+        else:
+            m_dot_act = noz_mdot_act[k - 1]
+            u_e = noz_ue[k - 1]
+            eta_u = noz_eta_u[k - 1]
 
         noz_T0[k] = T0
         noz_P0[k] = P0
