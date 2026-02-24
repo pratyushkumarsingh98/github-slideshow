@@ -22,9 +22,11 @@ from tqdm import tqdm
 EPS = 1e-30  # tiny number to prevent division-by-zero
 
 # =========================
-# PWM / Duty-cycle actuation (paper-like power spikes)
+# Actuation model
+# - "analog": apply commanded power directly (fine-grained power)
+# - "pwm": binary gate (0 or P_MAX), duty-averaged over time
 # =========================
-PWM_ON = True
+ACTUATION_MODE = "analog"  # "analog" or "pwm"
 PWM_PERIOD = 0.05
 P_MAX_PRE = None
 P_MAX_MAIN = None
@@ -804,14 +806,15 @@ def main():
 
         # Commands computed at time k are applied at k+1 (ZOH).
         t_next = t + FIXED_DT
-        if PWM_ON:
+        if ACTUATION_MODE.lower() == "pwm":
             g_pre = pwm_gate(t_next, d_pre, PWM_PERIOD)
             g_main = pwm_gate(t_next, d_main, PWM_PERIOD)
             Ppre_applied_next = g_pre * _Pmax_pre
             Pmain_applied_next = g_main * _Pmax_main
         else:
-            g_pre = 1.0
-            g_main = 1.0
+            # Analog actuation allows fine power (not only 0 or 20 W).
+            g_pre = d_pre
+            g_main = d_main
             Ppre_applied_next = Ppre_cmd_next
             Pmain_applied_next = Pmain_cmd_next
 
@@ -823,7 +826,7 @@ def main():
                 f"u2_raw(duty)={u2:7.3f} u3_raw(duty)={u3:7.3f} | "
                 f"Ppre_cmd(next)={Ppre_cmd_next:7.3f}W Pmain_cmd(next)={Pmain_cmd_next:7.3f}W | "
                 f"Ppre_applied(now)={Ppre_applied:7.3f}W Pmain_applied(now)={Pmain_applied:7.3f}W | "
-                f"d_pre={d_pre:5.3f} d_main={d_main:5.3f} g_pre(next)={g_pre:3.0f} g_main(next)={g_main:3.0f}"
+                f"d_pre={d_pre:5.3f} d_main={d_main:5.3f} act_pre(next)={g_pre:5.3f} act_main(next)={g_main:5.3f}"
             )
 
         Ppre_applied = Ppre_applied_next
