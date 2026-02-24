@@ -78,6 +78,14 @@ MIN_HC_W_M2K = 250.0          # lower bound for internal h to avoid q''/h blow-u
 MAX_QFLUX_W_M2 = 2.0e6        # cap local imposed heat flux for wall diagnostic stability
 MAX_WALL_SUPERHEAT_K = 120.0  # cap (T_wall - T_fluid) diagnostic rise
 
+# Paper-style neural adaptive PID constraints
+KP_MAX_PAPER = 0.001
+KI_MAX_PAPER = 0.01
+KD_MAX_PAPER = 0.0001
+NN_LEARNING_RATE = 0.5
+NN_INIT_STD = 0.005
+
+
 # =============================================================================
 # DISCRETIZATION / RUNTIME
 # =============================================================================
@@ -334,72 +342,79 @@ def setpoint_rtd3(t):
 
 
 # =============================================================================
-# ERROR-BASED ADAPTIVE PID
+# NEURAL ADAPTIVE PID (paper-style constraints)
 # =============================================================================
-class AdaptivePIDErrorBased:
+class AdaptivePIDNeural:
     def __init__(
         self,
-        kp0=0.0005,
-        ki0=0.005,
-        kd0=0.0001,
-        adapt_rate_p=0.1,
-        adapt_rate_i=0.1,
-        adapt_rate_d=0.05,
-        big_error_threshold=5.0,
+        kp_max=KP_MAX_PAPER,
+        ki_max=KI_MAX_PAPER,
+        kd_max=KD_MAX_PAPER,
+        learning_rate=NN_LEARNING_RATE,
+        init_std=NN_INIT_STD,
         integral_clip=1e6,
         u_max=1.0,
+        seed=42,
     ):
-        self.kp0 = kp0
-        self.ki0 = ki0
-        self.kd0 = kd0
-        self.kp = kp0
-        self.ki = ki0
-        self.kd = kd0
-        self.adapt_rate_p = adapt_rate_p
-        self.adapt_rate_i = adapt_rate_i
-        self.adapt_rate_d = adapt_rate_d
-        self.big_error_threshold = big_error_threshold
+        self.kp_max = float(kp_max)
+        self.ki_max = float(ki_max)
+        self.kd_max = float(kd_max)
+        self.learning_rate = float(learning_rate)
         self.u_max = u_max
         self.integral = 0.0
         self.last_error = 0.0
         self.integral_clip = float(integral_clip)
 
+        rng = np.random.default_rng(seed)
+        # Inputs: [error, derivative]
+        self.W = rng.normal(0.0, float(init_std), size=(3, 2))
+        self.b = np.zeros(3)
+
+        self.kp = 0.0
+        self.ki = 0.0
+        self.kd = 0.0
+
+    @staticmethod
+    def _sigmoid(x):
+        return 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
+
     def update(self, current_value, setpoint, dt):
         error = setpoint - current_value
+        derivative = (error - self.last_error) / dt if dt > 0.0 else 0.0
 
-        # Heating-only integration policy from the December script:
-        # accumulate when below setpoint, quickly decay when above.
-        if error > 0.0:
-            self.integral += error * dt
-        else:
-            self.integral *= max(0.0, 1.0 - 5.0 * dt)
+        self.integral += error * dt
         self.integral = float(np.clip(self.integral, -self.integral_clip, self.integral_clip))
 
-        derivative = (error - self.last_error) / dt if dt > 0.0 else 0.0
-        u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        # normalized NN inputs to stabilize online learning
+        x = np.array([error / 100.0, derivative / 2000.0], dtype=float)
 
-        # Heating actuator cannot command negative duty.
+        z = self.W @ x + self.b
+        g = self._sigmoid(z)
+
+        # Paper constraints: 0 <= K <= K_max
+        self.kp = float(np.clip(self.kp_max * g[0], 0.0, self.kp_max))
+        self.ki = float(np.clip(self.ki_max * g[1], 0.0, self.ki_max))
+        self.kd = float(np.clip(self.kd_max * g[2], 0.0, self.kd_max))
+
+        u = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
         u = max(u, 0.0)
         if self.u_max is not None:
             u = min(u, self.u_max)
 
-        abs_e = abs(error)
-        abs_last_e = abs(self.last_error)
-        big_err = self.big_error_threshold
+        # gradient-based online update (surrogate objective):
+        # minimize J = 0.5*e^2 + 0.01*u^2
+        # dJ/du surrogate couples tracking and power economy
+        dJ_du = -np.tanh(error / 50.0) + 0.01 * u
+        du_dg = np.array([error, self.integral, derivative], dtype=float)
+        gain_scale = np.array([self.kp_max, self.ki_max, self.kd_max], dtype=float)
+        dsig_dz = g * (1.0 - g)
 
-        if (error > 0.0) and (abs_e > big_err) and (abs_e >= abs_last_e):
-            self.kp *= 1.0 + self.adapt_rate_p * dt
-            self.ki *= 1.0 + self.adapt_rate_i * dt
+        dJ_dz = dJ_du * du_dg * gain_scale * dsig_dz
 
-        overshoot = (error < 0.0) and (abs_e > 0.5)
-        if overshoot and abs_last_e > big_err:
-            self.kp *= 1.0 - self.adapt_rate_p * dt
-            self.ki *= 1.0 - self.adapt_rate_i * dt
-            self.kd *= 1.0 + self.adapt_rate_d * dt
-
-        self.kp = float(np.clip(self.kp, 0.2 * self.kp0, 5.0 * self.kp0))
-        self.ki = float(np.clip(self.ki, 0.2 * self.ki0, 5.0 * self.ki0))
-        self.kd = float(np.clip(self.kd, 0.2 * self.kd0, 5.0 * self.kd0))
+        # paper-style learning rate applied in real-time update
+        lr = self.learning_rate
+        self.W += (-lr) * np.outer(dJ_dz, x)
+        self.b += (-lr) * dJ_dz
 
         self.last_error = error
         return float(u)
@@ -603,8 +618,8 @@ def main():
     A_pre = A_ext * frac_pre
     A_main = A_ext * frac_main
 
-    pid2 = AdaptivePIDErrorBased(u_max=1.0)
-    pid3 = AdaptivePIDErrorBased(u_max=1.0)
+    pid2 = AdaptivePIDNeural(u_max=1.0)
+    pid3 = AdaptivePIDNeural(u_max=1.0)
 
     Ppre_applied = 0.0
     Pmain_applied = 0.0
