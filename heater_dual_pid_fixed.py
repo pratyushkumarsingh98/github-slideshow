@@ -334,9 +334,9 @@ def setpoint_rtd3(t):
 
 
 # =============================================================================
-# ADAPTIVE PID
+# ERROR-BASED ADAPTIVE PID
 # =============================================================================
-class AdaptivePIDNN:
+class AdaptivePIDErrorBased:
     def __init__(
         self,
         kp0=0.0005,
@@ -603,8 +603,8 @@ def main():
     A_pre = A_ext * frac_pre
     A_main = A_ext * frac_main
 
-    pid2 = AdaptivePIDNN(u_max=1.0)
-    pid3 = AdaptivePIDNN(u_max=1.0)
+    pid2 = AdaptivePIDErrorBased(u_max=1.0)
+    pid3 = AdaptivePIDErrorBased(u_max=1.0)
 
     Ppre_applied = 0.0
     Pmain_applied = 0.0
@@ -644,6 +644,12 @@ def main():
     noz_mdot_act = np.zeros(n_steps)
     noz_ue = np.zeros(n_steps)
     noz_eta_u = np.zeros(n_steps)
+
+    # performance / power metrics for paper-style comparison
+    F_act = np.zeros(n_steps)
+    Isp_act = np.zeros(n_steps)
+    Ptot_cmd_before_losses_hist = np.zeros(n_steps)
+    Ptot_applied_hist = np.zeros(n_steps)
 
     SP2_f = float(setpoint_rtd2(0.0))
     SP3_f = float(setpoint_rtd3(0.0))
@@ -704,6 +710,11 @@ def main():
         noz_ue[k] = u_e
         noz_eta_u[k] = eta_u
 
+        F = float(m_dot_act * u_e * eta_u)
+        Isp = float(F / (m_dot_act * g0 + 1e-8)) if m_dot_act > 0.0 else 0.0
+        F_act[k] = F
+        Isp_act[k] = Isp
+
         T2_hist[k] = T2
         Tw2_hist[k] = Tw2
         T3_hist[k] = T3
@@ -725,6 +736,10 @@ def main():
         u3 = float(pid3.update(T3, SP3_f, FIXED_DT))
         u2_raw[k] = u2
         u3_raw[k] = u3
+
+        # Paper-style comparison metric: total commanded heater power before
+        # any loss-compensation hold logic and supervisory allocation layers.
+        Ptot_cmd_before_losses_hist[k] = (float(np.clip(u2, 0.0, 1.0)) + float(np.clip(u3, 0.0, 1.0))) * q_max
 
         kp2_hist[k], ki2_hist[k], kd2_hist[k] = pid2.kp, pid2.ki, pid2.kd
         kp3_hist[k], ki3_hist[k], kd3_hist[k] = pid3.kp, pid3.ki, pid3.kd
@@ -803,6 +818,7 @@ def main():
 
         Ppre_applied_hist[k] = Ppre_applied
         Pmain_applied_hist[k] = Pmain_applied
+        Ptot_applied_hist[k] = Ppre_applied + Pmain_applied
         Ppre_cmd_next_hist[k] = Ppre_cmd_next
         Pmain_cmd_next_hist[k] = Pmain_cmd_next
 
@@ -832,6 +848,7 @@ def main():
                 f"SP2={SP2:7.2f}K T2_fl={T2:7.2f}K T2_w={Tw2:7.2f}K e2={e2:8.2f} | "
                 f"SP3={SP3:7.2f}K T3_fl={T3:7.2f}K T3_w={Tw3:7.2f}K e3={e3:8.2f} | "
                 f"u2_raw(duty)={u2:7.3f} u3_raw(duty)={u3:7.3f} | "
+                f"Ptot_cmd_before_losses={Ptot_cmd_before_losses_hist[k]:7.3f}W | "
                 f"Ppre_cmd(next)={Ppre_cmd_next:7.3f}W Pmain_cmd(next)={Pmain_cmd_next:7.3f}W | "
                 f"Ppre_applied(now)={Ppre_applied:7.3f}W Pmain_applied(now)={Pmain_applied:7.3f}W | "
                 f"d_pre={d_pre:5.3f} d_main={d_main:5.3f} act_pre(next)={g_pre:5.3f} act_main(next)={g_main:5.3f}"
@@ -882,6 +899,33 @@ def main():
 
     plot_heater_panel("RTD2", T2_hist, Tw2_hist, SP2_f_hist, Ppre_applied_hist, kp2_hist, ki2_hist, kd2_hist)
     plot_heater_panel("RTD3", T3_hist, Tw3_hist, SP3_f_hist, Pmain_applied_hist, kp3_hist, ki3_hist, kd3_hist)
+
+    sim_time = float(time[-1]) if time[-1] > 0.0 else 1.0
+    Etot_cmd_before_losses = float(np.trapz(Ptot_cmd_before_losses_hist, time))
+    Pavg_cmd_before_losses = Etot_cmd_before_losses / sim_time
+    Etot_applied_total = float(np.trapz(Ptot_applied_hist, time))
+    Pavg_applied_total = Etot_applied_total / sim_time
+    print("\n=== Paper-style power comparison ===")
+    print(f"Total commanded power before loss compensation: E_tot={Etot_cmd_before_losses:.3f} J, P_avg={Pavg_cmd_before_losses:.3f} W")
+    print(f"Total applied heater power (pre+main):          E_tot={Etot_applied_total:.3f} J, P_avg={Pavg_applied_total:.3f} W")
+
+    plt.figure(figsize=(10, 8))
+    tx1 = plt.subplot(2, 1, 1)
+    tx1.plot(time, F_act * 1e3, label="Thrust [mN]")
+    tx1.set_title("Thrust Over Time")
+    tx1.set_xlabel("Time [s]")
+    tx1.set_ylabel("Thrust [mN]")
+    tx1.grid(True)
+    tx1.legend()
+
+    tx2 = plt.subplot(2, 1, 2)
+    tx2.plot(time, Isp_act, label="Isp [s]")
+    tx2.set_title("Specific Impulse Over Time")
+    tx2.set_xlabel("Time [s]")
+    tx2.set_ylabel("Isp [s]")
+    tx2.grid(True)
+    tx2.legend()
+    plt.tight_layout()
 
     plt.figure(figsize=(14, 10))
 
