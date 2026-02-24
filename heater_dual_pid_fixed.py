@@ -73,6 +73,10 @@ OVERSHOOT_GUARD_HORIZON_S = 0.25  # [s] predictive cutoff horizon
 NOZZLE_DIAGNOSTICS_EVERY = 10  # compute expensive nozzle metrics every N steps (1 = every step)
 PREHEAT_HARD_CUTOFF_K = 0.5  # [K] force preheater OFF above filtered setpoint
 MAIN_HARD_CUTOFF_K = 0.5     # [K] force main heater OFF above filtered setpoint
+# Wall-temperature stabilization guards
+MIN_HC_W_M2K = 250.0          # lower bound for internal h to avoid q''/h blow-ups
+MAX_QFLUX_W_M2 = 2.0e6        # cap local imposed heat flux for wall diagnostic stability
+MAX_WALL_SUPERHEAT_K = 120.0  # cap (T_wall - T_fluid) diagnostic rise
 
 # =============================================================================
 # DISCRETIZATION / RUNTIME
@@ -548,7 +552,8 @@ def plant_step_transient(
         p_new[i] = float(max(p_new[i - 1] - dp, 1e3))
 
         Nu = 4.96
-        hc = Nu * k_mix / (Dh[i] + EPS)
+        hc_raw = Nu * k_mix / (Dh[i] + EPS)
+        hc_eff = max(hc_raw, MIN_HC_W_M2K)
 
         if i < rtd2:
             qflux = Q[i] / (Perim[i] * dx + EPS)
@@ -556,11 +561,14 @@ def plant_step_transient(
             qflux = Q[i] / (W_int[i] * dx + EPS)
         else:
             qflux = 0.0
+        qflux = float(np.clip(qflux, 0.0, MAX_QFLUX_W_M2))
 
         T_new = robust_temperature_from_ph(p_new[i], h_new[i], specie)
 
         T_fl[i] = float(T_new)
-        T_w[i] = qflux / (hc + EPS) + float(T_new)
+        dT_wall = qflux / (hc_eff + EPS)
+        dT_wall = float(np.clip(dT_wall, 0.0, MAX_WALL_SUPERHEAT_K))
+        T_w[i] = float(T_new) + dT_wall
 
     T_fl[0] = T_inlet
     T_w[0] = T_inlet
