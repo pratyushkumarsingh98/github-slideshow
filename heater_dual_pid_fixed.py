@@ -77,6 +77,8 @@ MAIN_HARD_CUTOFF_K = 0.5     # [K] force main heater OFF above filtered setpoint
 MIN_HC_W_M2K = 250.0          # lower bound for internal h to avoid q''/h blow-ups
 MAX_QFLUX_W_M2 = 2.0e6        # cap local imposed heat flux for wall diagnostic stability
 MAX_WALL_SUPERHEAT_K = 120.0  # cap (T_wall - T_fluid) diagnostic rise
+WALL_CAP_PRE_J_PER_K = 0.02
+WALL_CAP_MAIN_J_PER_K = 0.03
 
 # Paper-style neural adaptive PID constraints
 KP_MAX_PAPER = 0.001
@@ -301,6 +303,15 @@ def calculation_P_conv(h_conv, T_wall, T_amb, A_ext_local):
     return h_conv * A_ext_local * (T_wall - T_amb)
 
 
+def zone_losses(Tw_zone, A_zone):
+    losses = (
+        calculation_P_rad(Tw_zone, T_ambient, em, sigma_stef_boltz, A_zone)
+        + calculation_P_conv(h_conv_ext, Tw_zone, T_ambient, A_zone)
+        + 0.001 * calculation_P_cond_struct(k_Si, Tw_zone, T_ambient, A_zone, L_ext)
+    )
+    return float(max(losses, 0.0))
+
+
 def robust_temperature_from_ph(p_val, h_val, specie):
     """Return temperature from (p,h) with minimal state distortion on fallback."""
     p_use = float(max(p_val, 1e3))
@@ -495,9 +506,13 @@ def plant_step_transient(
     L_int,
     dx,
     mass_flow,
-    P_pre,
-    P_main,
+    P_pre_net,
+    P_main_net,
     dt_fixed,
+    Tw_pre_zone,
+    Tw_main_zone,
+    Cw_pre,
+    Cw_main,
 ):
     n = len(h)
     rtd2 = find_nearest_index(x, L_inlet + L_uCh)
@@ -509,14 +524,8 @@ def plant_step_transient(
     n_pre = max(rtd2, 1)
     n_main = max(rtd3 - rtd2, 1)
 
-    Q = np.zeros(n)
-    for i in range(n):
-        if i < rtd2:
-            Q[i] = P_pre / n_pre
-        elif i < rtd3:
-            Q[i] = P_main / n_main
-        else:
-            Q[i] = 0.0
+    Ppre_cell = float(max(P_pre_net, 0.0)) / n_pre
+    Pmain_cell = float(max(P_main_net, 0.0)) / n_main
 
     T_fl = np.zeros(n)
     T_w = np.zeros(n)
@@ -524,13 +533,14 @@ def plant_step_transient(
     h_new = h.copy()
     p_new = p.copy()
 
+    Qdot_f_pre_sum = 0.0
+    Qdot_f_main_sum = 0.0
+
     for i in range(1, n):
         p_i = float(max(p[i], 1e3))
 
         T_i = robust_temperature_from_ph(p_i, h[i], specie)
 
-        # Use a bounded local enthalpy only for property evaluation; do not
-        # overwrite the transported state directly to avoid artificial plateaus.
         hL_loc = CP.PropsSI("H", "P", p_i, "Q", 0, specie)
         hV_loc = CP.PropsSI("H", "P", p_i, "Q", 1, specie)
         h_eval = float(np.clip(h[i], hL_loc - 8e4, hV_loc + 8e4))
@@ -560,35 +570,56 @@ def plant_step_transient(
         v = mass_flow / (rho * A_flow + EPS)
         CFL = float(np.clip(v * dt_fixed / (dx + EPS), 0.0, 1.0))
 
-        dh_src = CFL * (Q[i] / (mass_flow + EPS))
-        h_new[i] = h[i] - CFL * (h[i] - h[i - 1]) + dh_src
-
         dp = 12.0 * mu_mix * (v / (H_int**2 + EPS)) * dx
         p_new[i] = float(max(p_new[i - 1] - dp, 1e3))
 
         Nu = 4.96
-        hc_raw = Nu * k_mix / (Dh[i] + EPS)
-        hc_eff = max(hc_raw, MIN_HC_W_M2K)
+        hb = Nu * k_mix / (Dh[i] + EPS)
 
         if i < rtd2:
-            qflux = Q[i] / (Perim[i] * dx + EPS)
+            Tw_loc = float(Tw_pre_zone)
+            A_ex_i = float(Perim[i] * dx)
+            Pcell = Ppre_cell
+            zone = "pre"
         elif i < rtd3:
-            qflux = Q[i] / (W_int[i] * dx + EPS)
+            Tw_loc = float(Tw_main_zone)
+            A_ex_i = float(W_int[i] * dx)
+            Pcell = Pmain_cell
+            zone = "main"
         else:
-            qflux = 0.0
-        qflux = float(np.clip(qflux, 0.0, MAX_QFLUX_W_M2))
+            Tw_loc = float(T_i)
+            A_ex_i = float(W_int[i] * dx)
+            Pcell = 0.0
+            zone = "none"
+
+        Qdot_f_i = max(0.0, hb * (Tw_loc - float(T_i)) * A_ex_i)
+        # steady marching contribution from zone net power in that cell
+        Qdot_f_i += Pcell
+
+        if zone == "pre":
+            Qdot_f_pre_sum += Qdot_f_i
+        elif zone == "main":
+            Qdot_f_main_sum += Qdot_f_i
+
+        dh_src = Qdot_f_i * dt_fixed / (mass_flow + EPS)
+        h_new[i] = h[i] - CFL * (h[i] - h[i - 1]) + dh_src
 
         T_new = robust_temperature_from_ph(p_new[i], h_new[i], specie)
-
         T_fl[i] = float(T_new)
-        dT_wall = qflux / (hc_eff + EPS)
-        dT_wall = float(np.clip(dT_wall, 0.0, MAX_WALL_SUPERHEAT_K))
-        T_w[i] = float(T_new) + dT_wall
+        if zone == "pre":
+            T_w[i] = float(Tw_pre_zone)
+        elif zone == "main":
+            T_w[i] = float(Tw_main_zone)
+        else:
+            T_w[i] = float(T_new)
+
+    Tw_pre_next = float(Tw_pre_zone + dt_fixed * (max(P_pre_net, 0.0) - Qdot_f_pre_sum) / max(Cw_pre, EPS))
+    Tw_main_next = float(Tw_main_zone + dt_fixed * (max(P_main_net, 0.0) - Qdot_f_main_sum) / max(Cw_main, EPS))
 
     T_fl[0] = T_inlet
-    T_w[0] = T_inlet
+    T_w[0] = Tw_pre_next
 
-    return h_new, p_new, T_fl, T_w
+    return h_new, p_new, T_fl, T_w, Tw_pre_next, Tw_main_next
 
 
 # =============================================================================
@@ -623,6 +654,8 @@ def main():
 
     Ppre_applied = 0.0
     Pmain_applied = 0.0
+    Tw_pre_zone = float(T_wall_start)
+    Tw_main_zone = float(T_wall_start)
 
     h0 = float(CP.PropsSI("H", "P", p_start, "T", T_fl_start, specie))
     h = np.ones(n_it) * h0
@@ -675,7 +708,13 @@ def main():
         t = k * FIXED_DT
         time[k] = t
 
-        h, p, T_fl, T_wall = plant_step_transient(
+        # paper-style net power: subtract losses before thermal update
+        losses_pre_now = zone_losses(Tw_pre_zone, A_pre)
+        losses_main_now = zone_losses(Tw_main_zone, A_main)
+        Ppre_net_now = max(Ppre_applied - losses_pre_now, 0.0)
+        Pmain_net_now = max(Pmain_applied - losses_main_now, 0.0)
+
+        h, p, T_fl, T_wall, Tw_pre_zone, Tw_main_zone = plant_step_transient(
             h,
             p,
             xg,
@@ -691,9 +730,13 @@ def main():
             L_int,
             dx,
             mass_flow,
-            Ppre_applied,
-            Pmain_applied,
+            Ppre_net_now,
+            Pmain_net_now,
             FIXED_DT,
+            Tw_pre_zone,
+            Tw_main_zone,
+            WALL_CAP_PRE_J_PER_K,
+            WALL_CAP_MAIN_J_PER_K,
         )
 
         T2 = float(T_fl[rtd2])
