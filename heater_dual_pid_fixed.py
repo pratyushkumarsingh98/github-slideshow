@@ -318,7 +318,8 @@ def zone_losses(Tw_zone, A_zone):
 
 def estimate_representative_velocity(h, p, A_cs, mass_flow, specie):
     """Estimate representative channel velocity for adaptive-CFL dt selection."""
-    vmax = 0.0
+    v_sum = 0.0
+    n_pts = 0
     for i in range(1, len(h)):
         p_i = float(max(p[i], 1e3))
         h_i = float(h[i])
@@ -330,9 +331,9 @@ def estimate_representative_velocity(h, p, A_cs, mass_flow, specie):
             h_eval = float(np.clip(h_i, hL - 8e4, hV + 8e4))
             rho_i = float(CP.PropsSI("D", "P", p_i, "H", h_eval, specie))
         v_i = mass_flow / (max(rho_i, EPS) * max(float(A_cs[i]), EPS))
-        if v_i > vmax:
-            vmax = v_i
-    return float(max(vmax, EPS))
+        v_sum += v_i
+        n_pts += 1
+    return float(max(v_sum / max(n_pts, 1), EPS))
 
 
 def robust_temperature_from_ph(p_val, h_val, specie):
@@ -633,6 +634,13 @@ def plant_step_transient(
     pre_available = max(P_pre_net, 0.0) + max(Cw_pre, EPS) * max(Tw_pre_zone - Tref_pre, 0.0) / max(dt_fixed, EPS)
     main_available = max(P_main_net, 0.0) + max(Cw_main, EPS) * max(Tw_main_zone - Tref_main, 0.0) / max(dt_fixed, EPS)
 
+    Qdot_f_pre_sum_raw = float(Qdot_f_pre_sum)
+    Qdot_f_main_sum_raw = float(Qdot_f_main_sum)
+    scale_pre = float(min(1.0, pre_available / (Qdot_f_pre_sum_raw + 1e-12)))
+    scale_main = float(min(1.0, main_available / (Qdot_f_main_sum_raw + 1e-12)))
+    Qdot_f_pre_sum = Qdot_f_pre_sum_raw * scale_pre
+    Qdot_f_main_sum = Qdot_f_main_sum_raw * scale_main
+
     Tw_pre_next = float(Tw_pre_zone + dt_fixed * (max(P_pre_net, 0.0) - Qdot_f_pre_sum) / max(Cw_pre, EPS))
     Tw_main_next = float(Tw_main_zone + dt_fixed * (max(P_main_net, 0.0) - Qdot_f_main_sum) / max(Cw_main, EPS))
 
@@ -642,8 +650,12 @@ def plant_step_transient(
     conv_diag = {
         "pre_qconv": float(Qdot_f_pre_sum),
         "main_qconv": float(Qdot_f_main_sum),
+        "pre_qconv_raw": float(Qdot_f_pre_sum_raw),
+        "main_qconv_raw": float(Qdot_f_main_sum_raw),
         "pre_qavail": float(pre_available),
         "main_qavail": float(main_available),
+        "pre_scale": float(scale_pre),
+        "main_scale": float(scale_main),
     }
 
     return h_new, p_new, T_fl, T_w, Tw_pre_next, Tw_main_next, conv_diag
@@ -840,8 +852,8 @@ def main():
         losses_pre = losses_pre_now
         losses_main = losses_main_now
 
-        conv_overdraw_pre_hist[k] = max(0.0, conv_diag["pre_qconv"] - conv_diag["pre_qavail"])
-        conv_overdraw_main_hist[k] = max(0.0, conv_diag["main_qconv"] - conv_diag["main_qavail"])
+        conv_overdraw_pre_hist[k] = max(0.0, conv_diag["pre_qconv_raw"] - conv_diag["pre_qavail"])
+        conv_overdraw_main_hist[k] = max(0.0, conv_diag["main_qconv_raw"] - conv_diag["main_qavail"])
 
         if e2 > deadband:
             d_pre_cmd_next = float(np.clip(u2, 0.0, 1.0))
