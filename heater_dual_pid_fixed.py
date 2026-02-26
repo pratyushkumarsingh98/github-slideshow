@@ -79,6 +79,11 @@ MAX_QFLUX_W_M2 = 2.0e6        # cap local imposed heat flux for wall diagnostic 
 MAX_WALL_SUPERHEAT_K = 120.0  # cap (T_wall - T_fluid) diagnostic rise
 WALL_CAP_PRE_J_PER_K = 0.02
 WALL_CAP_MAIN_J_PER_K = 0.03
+# Minimal dryout/regime model (placeholder until CHF correlation is added)
+NU_BASE = 4.96
+X_DRYOUT_ONSET = 0.85
+NU_POST_DRYOUT_MIN = 1.2
+DRYOUT_NU_DROP_MAX = 0.7
 
 # Paper-style neural adaptive PID constraints
 KP_MAX_PAPER = 0.001
@@ -521,12 +526,6 @@ def plant_step_transient(
     p[0] = float(max(p0, 1e3))
     h[0] = float(CP.PropsSI("H", "P", p[0], "T", T_inlet, specie))
 
-    n_pre = max(rtd2, 1)
-    n_main = max(rtd3 - rtd2, 1)
-
-    Ppre_cell = float(max(P_pre_net, 0.0)) / n_pre
-    Pmain_cell = float(max(P_main_net, 0.0)) / n_main
-
     T_fl = np.zeros(n)
     T_w = np.zeros(n)
 
@@ -573,28 +572,29 @@ def plant_step_transient(
         dp = 12.0 * mu_mix * (v / (H_int**2 + EPS)) * dx
         p_new[i] = float(max(p_new[i - 1] - dp, 1e3))
 
-        Nu = 4.96
-        hb = Nu * k_mix / (Dh[i] + EPS)
+        x_loc = float(np.clip(quality_from_hP(h_eval, p_i, specie, clip=False), 0.0, 1.0))
+        if x_loc >= X_DRYOUT_ONSET:
+            dryout_frac = (x_loc - X_DRYOUT_ONSET) / max(1.0 - X_DRYOUT_ONSET, EPS)
+            dryout_frac = float(np.clip(dryout_frac, 0.0, 1.0))
+            Nu_eff = NU_BASE * (1.0 - DRYOUT_NU_DROP_MAX * dryout_frac)
+            Nu_eff = float(max(NU_POST_DRYOUT_MIN, Nu_eff))
+        else:
+            Nu_eff = NU_BASE
+
+        hb = Nu_eff * k_mix / (Dh[i] + EPS)
 
         if i < rtd2:
             Tw_loc = float(Tw_pre_zone)
-            A_ex_i = float(Perim[i] * dx)
-            Pcell = Ppre_cell
             zone = "pre"
         elif i < rtd3:
             Tw_loc = float(Tw_main_zone)
-            A_ex_i = float(W_int[i] * dx)
-            Pcell = Pmain_cell
             zone = "main"
         else:
             Tw_loc = float(T_i)
-            A_ex_i = float(W_int[i] * dx)
-            Pcell = 0.0
             zone = "none"
 
+        A_ex_i = float(Perim[i] * dx)
         Qdot_f_i = max(0.0, hb * (Tw_loc - float(T_i)) * A_ex_i)
-        # steady marching contribution from zone net power in that cell
-        Qdot_f_i += Pcell
 
         if zone == "pre":
             Qdot_f_pre_sum += Qdot_f_i
