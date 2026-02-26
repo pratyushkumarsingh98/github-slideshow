@@ -553,11 +553,23 @@ def plant_step_transient(
 
     Qdot_f_pre_sum = 0.0
     Qdot_f_main_sum = 0.0
+    cfl_clip_count = 0
+
+    qdot_raw = np.zeros(n)
+    cfl_arr = np.zeros(n)
+    zone_tag = np.full(n, "none", dtype=object)
+    T_old = np.zeros(n)
+
+    pre_t_sum = 0.0
+    pre_t_n = 0
+    main_t_sum = 0.0
+    main_t_n = 0
 
     for i in range(1, n):
         p_i = float(max(p[i], 1e3))
 
         T_i = robust_temperature_from_ph(p_i, h[i], specie)
+        T_old[i] = float(T_i)
 
         hL_loc = CP.PropsSI("H", "P", p_i, "Q", 0, specie)
         hV_loc = CP.PropsSI("H", "P", p_i, "Q", 1, specie)
@@ -586,7 +598,11 @@ def plant_step_transient(
 
         A_flow = float(W_int[i] * H_int)
         v = mass_flow / (rho * A_flow + EPS)
-        CFL = float(np.clip(v * dt_fixed / (dx + EPS), 0.0, 1.0))
+        cfl_raw = v * dt_fixed / (dx + EPS)
+        if cfl_raw > 1.0:
+            cfl_clip_count += 1
+        CFL = float(np.clip(cfl_raw, 0.0, 1.0))
+        cfl_arr[i] = CFL
 
         dp = 12.0 * mu_mix * (v / (H_int**2 + EPS)) * dx
         p_new[i] = float(max(p_new[i - 1] - dp, 1e3))
@@ -594,9 +610,13 @@ def plant_step_transient(
         if i < rtd2:
             Tw_loc = float(Tw_pre_zone)
             zone = "pre"
+            pre_t_sum += float(T_i)
+            pre_t_n += 1
         elif i < rtd3:
             Tw_loc = float(Tw_main_zone)
             zone = "main"
+            main_t_sum += float(T_i)
+            main_t_n += 1
         else:
             Tw_loc = float(T_i)
             zone = "none"
@@ -604,17 +624,50 @@ def plant_step_transient(
         hb_nom = NU_BASE * k_mix / (Dh[i] + EPS)
         q_flux_dem = max(0.0, hb_nom * (Tw_loc - float(T_i)))
 
-        hb = hb_nom
         A_ex_i = float(Perim[i] * dx)
         Qdot_f_i = q_flux_dem * A_ex_i
+
+        zone_tag[i] = zone
+        qdot_raw[i] = float(Qdot_f_i)
 
         if zone == "pre":
             Qdot_f_pre_sum += Qdot_f_i
         elif zone == "main":
             Qdot_f_main_sum += Qdot_f_i
 
-        dh_src = Qdot_f_i * dt_fixed / (mass_flow + EPS)
-        h_new[i] = h[i] - CFL * (h[i] - h[i - 1]) + dh_src
+    Tref_pre = float(pre_t_sum / pre_t_n) if pre_t_n > 0 else float(T_inlet)
+    Tref_main = float(main_t_sum / main_t_n) if main_t_n > 0 else float(T_old[min(max(rtd2, 1), n - 1)])
+
+    pre_available = max(P_pre_net, 0.0) + max(Cw_pre, EPS) * max(Tw_pre_zone - Tref_pre, 0.0) / max(dt_fixed, EPS)
+    main_available = max(P_main_net, 0.0) + max(Cw_main, EPS) * max(Tw_main_zone - Tref_main, 0.0) / max(dt_fixed, EPS)
+
+    Qdot_f_pre_sum_raw = float(Qdot_f_pre_sum)
+    Qdot_f_main_sum_raw = float(Qdot_f_main_sum)
+    scale_pre = float(min(1.0, pre_available / (Qdot_f_pre_sum_raw + 1e-12)))
+    scale_main = float(min(1.0, main_available / (Qdot_f_main_sum_raw + 1e-12)))
+
+    Qdot_f_pre_sum = 0.0
+    Qdot_f_main_sum = 0.0
+
+    T_fl[0] = T_inlet
+    T_w[0] = float(Tw_pre_zone)
+
+    for i in range(1, n):
+        zone = zone_tag[i]
+        if zone == "pre":
+            qdot_i = qdot_raw[i] * scale_pre
+            Tw_loc = float(Tw_pre_zone)
+            Qdot_f_pre_sum += qdot_i
+        elif zone == "main":
+            qdot_i = qdot_raw[i] * scale_main
+            Tw_loc = float(Tw_main_zone)
+            Qdot_f_main_sum += qdot_i
+        else:
+            qdot_i = qdot_raw[i]
+            Tw_loc = float(T_old[i])
+
+        dh_src = qdot_i * dt_fixed / (mass_flow + EPS)
+        h_new[i] = h[i] - cfl_arr[i] * (h[i] - h[i - 1]) + dh_src
 
         T_new = robust_temperature_from_ph(p_new[i], h_new[i], specie)
         T_fl[i] = float(T_new)
@@ -624,23 +677,6 @@ def plant_step_transient(
             T_w[i] = float(Tw_main_zone)
         else:
             T_w[i] = float(T_new)
-
-    pre_zone_mask = slice(1, max(rtd2, 1))
-    main_zone_mask = slice(max(rtd2, 1), max(rtd3, rtd2 + 1))
-    Tref_pre = float(np.mean(T_fl[pre_zone_mask])) if (max(rtd2, 1) - 1) > 0 else float(T_inlet)
-    main_fallback_idx = min(max(rtd2, 1), n - 1)
-    Tref_main = float(np.mean(T_fl[main_zone_mask])) if (max(rtd3, rtd2 + 1) - max(rtd2, 1)) > 0 else float(T_fl[main_fallback_idx])
-
-    pre_available = max(P_pre_net, 0.0) + max(Cw_pre, EPS) * max(Tw_pre_zone - Tref_pre, 0.0) / max(dt_fixed, EPS)
-    main_available = max(P_main_net, 0.0) + max(Cw_main, EPS) * max(Tw_main_zone - Tref_main, 0.0) / max(dt_fixed, EPS)
-
-    Qdot_f_pre_sum_raw = float(Qdot_f_pre_sum)
-    Qdot_f_main_sum_raw = float(Qdot_f_main_sum)
-    scale_pre = float(min(1.0, pre_available / (Qdot_f_pre_sum_raw + 1e-12)))
-    scale_main = float(min(1.0, main_available / (Qdot_f_main_sum_raw + 1e-12)))
-    Qdot_f_pre_sum = Qdot_f_pre_sum_raw * scale_pre
-    Qdot_f_main_sum = Qdot_f_main_sum_raw * scale_main
-
     Tw_pre_next = float(Tw_pre_zone + dt_fixed * (max(P_pre_net, 0.0) - Qdot_f_pre_sum) / max(Cw_pre, EPS))
     Tw_main_next = float(Tw_main_zone + dt_fixed * (max(P_main_net, 0.0) - Qdot_f_main_sum) / max(Cw_main, EPS))
 
@@ -656,6 +692,7 @@ def plant_step_transient(
         "main_qavail": float(main_available),
         "pre_scale": float(scale_pre),
         "main_scale": float(scale_main),
+        "cfl_clip_count": int(cfl_clip_count),
     }
 
     return h_new, p_new, T_fl, T_w, Tw_pre_next, Tw_main_next, conv_diag
@@ -740,6 +777,7 @@ def main():
     dt_hist = np.zeros(n_steps)
     conv_overdraw_pre_hist = np.zeros(n_steps)
     conv_overdraw_main_hist = np.zeros(n_steps)
+    cfl_clip_count_hist = np.zeros(n_steps)
 
     SP2_f = float(setpoint_rtd2(0.0))
     SP3_f = float(setpoint_rtd3(0.0))
@@ -854,6 +892,7 @@ def main():
 
         conv_overdraw_pre_hist[k] = max(0.0, conv_diag["pre_qconv_raw"] - conv_diag["pre_qavail"])
         conv_overdraw_main_hist[k] = max(0.0, conv_diag["main_qconv_raw"] - conv_diag["main_qavail"])
+        cfl_clip_count_hist[k] = conv_diag["cfl_clip_count"]
 
         if e2 > deadband:
             d_pre_cmd_next = float(np.clip(u2, 0.0, 1.0))
