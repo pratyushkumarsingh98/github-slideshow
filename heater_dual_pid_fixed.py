@@ -81,11 +81,13 @@ MAX_QFLUX_W_M2 = 2.0e6        # cap local imposed heat flux for wall diagnostic 
 MAX_WALL_SUPERHEAT_K = 120.0  # cap (T_wall - T_fluid) diagnostic rise
 WALL_CAP_PRE_J_PER_K = 0.02
 WALL_CAP_MAIN_J_PER_K = 0.03
-# Minimal dryout/regime model (placeholder until CHF correlation is added)
+# CHF / dryout correlation controls
 NU_BASE = 4.96
-X_DRYOUT_ONSET = 0.85
 NU_POST_DRYOUT_MIN = 1.2
-DRYOUT_NU_DROP_MAX = 0.7
+XDO_MIN = 0.55
+XDO_MAX = 0.98
+CHF_C0 = 0.131  # Kutateladze-style prefactor
+CHF_SAFETY_FACTOR = 0.90
 
 # Paper-style neural adaptive PID constraints
 KP_MAX_PAPER = 0.001
@@ -169,6 +171,48 @@ def quality_from_hP(h_val, p_val, specie="Water", clip=True):
     if clip:
         x = np.clip(x, 0.0, 1.0)
     return float(x)
+
+
+def compute_chf_dryout_state(x_loc, G, Dh_i, rho_l, rho_v, mu_l, h_fg, sigma, q_flux_dem):
+    """Correlation-based dryout/CHF model for microchannel two-phase flow.
+
+    Returns:
+        x_do: dryout-onset quality from combined correlations
+        q_chf: local CHF estimate [W/m^2]
+        q_flux_lim: capped convective heat flux [W/m^2]
+        Nu_eff_scale: multiplicative factor applied to nominal Nu
+        regime: string label
+    """
+    # Dimensionless groups
+    Bo = float(np.clip(q_flux_dem / (max(G, EPS) * max(h_fg, EPS)), 1e-8, 1.0))
+    We_lo = float(np.clip((G**2) * max(Dh_i, EPS) / (max(rho_l, EPS) * max(sigma, EPS)), 1e-8, 1e8))
+    La = float(np.clip(max(sigma, EPS) * max(rho_l - rho_v, EPS) * max(Dh_i, EPS) / (max(rho_v, EPS) * (max(mu_l, EPS)**2)), 1e-6, 1e10))
+
+    # Dryout-onset quality correlations (bounded, blended by minimum for conservative prediction)
+    x_incip = float(np.clip(0.99 - 2.25 * (Bo ** 0.35), XDO_MIN, XDO_MAX))
+    x_crit = float(np.clip(0.88 - 0.08 * (We_lo ** -0.10), XDO_MIN, XDO_MAX))
+    x_dry_max = float(np.clip(0.96 - 0.04 * (La ** -0.05), XDO_MIN, XDO_MAX))
+    x_do = float(np.clip(min(x_incip, x_crit, x_dry_max), XDO_MIN, XDO_MAX))
+
+    # Kutateladze-like CHF estimate with two-phase velocity boost
+    q_chf = CHF_C0 * h_fg * math.sqrt(max(rho_v, EPS)) * (max(sigma, EPS) * g0 * max(rho_l - rho_v, EPS)) ** 0.25
+    two_phase_boost = float(np.clip((1.0 + 2.0 * We_lo ** 0.20), 1.0, 6.0))
+    q_chf *= two_phase_boost * CHF_SAFETY_FACTOR
+
+    if not (0.0 < x_loc < 1.0):
+        return x_do, q_chf, q_flux_dem, 1.0, "single_phase"
+
+    if x_loc < x_do:
+        q_flux_lim = min(q_flux_dem, q_chf)
+        return x_do, q_chf, q_flux_lim, 1.0, "nucleate_boiling"
+
+    # Post-dryout: degrade transfer with quality and CHF exceedance
+    dryout_frac = float(np.clip((x_loc - x_do) / max(1.0 - x_do, EPS), 0.0, 1.0))
+    chf_ratio = float(np.clip(q_flux_dem / max(q_chf, EPS), 0.0, 5.0))
+    nu_scale = float(np.clip((1.0 - 0.80 * dryout_frac) * (1.0 / (1.0 + 0.35 * max(chf_ratio - 1.0, 0.0))),
+                             NU_POST_DRYOUT_MIN / max(NU_BASE, EPS), 1.0))
+    q_flux_lim = min(q_flux_dem, q_chf)
+    return x_do, q_chf, q_flux_lim, nu_scale, "post_dryout"
 
 
 def nozzle_metrics(T0, P0, x_vap, specie="Water"):
@@ -555,6 +599,8 @@ def plant_step_transient(
 
     Qdot_f_pre_sum = 0.0
     Qdot_f_main_sum = 0.0
+    chf_limited_cells = 0
+    post_dryout_cells = 0
 
     for i in range(1, n):
         p_i = float(max(p[i], 1e3))
@@ -594,14 +640,27 @@ def plant_step_transient(
         p_new[i] = float(max(p_new[i - 1] - dp, 1e3))
 
         x_loc = float(np.clip(quality_from_hP(h_eval, p_i, specie, clip=False), 0.0, 1.0))
-        if 0.0 < x_loc < 1.0 and x_loc >= X_DRYOUT_ONSET:
-            dryout_frac = (x_loc - X_DRYOUT_ONSET) / max(1.0 - X_DRYOUT_ONSET, EPS)
-            dryout_frac = float(np.clip(dryout_frac, 0.0, 1.0))
-            Nu_eff = NU_BASE * (1.0 - DRYOUT_NU_DROP_MAX * dryout_frac)
-            Nu_eff = float(max(NU_POST_DRYOUT_MIN, Nu_eff))
-        else:
-            Nu_eff = NU_BASE
+        rhoL_loc = CP.PropsSI("D", "P", p_i, "Q", 0, specie)
+        rhoV_loc = CP.PropsSI("D", "P", p_i, "Q", 1, specie)
+        hfg_loc = CP.PropsSI("H", "P", p_i, "Q", 1, specie) - CP.PropsSI("H", "P", p_i, "Q", 0, specie)
+        sigma_loc = CP.PropsSI("I", "P", p_i, "Q", 0, specie)
+        G_loc = mass_flow / (A_flow + EPS)
 
+        hb_nom = NU_BASE * k_mix / (Dh[i] + EPS)
+
+        q_flux_dem = max(0.0, hb_nom * (float((Tw_pre_zone if i < rtd2 else Tw_main_zone) if i < rtd3 else T_i) - float(T_i)))
+        x_do, q_chf, q_flux_lim, nu_scale, regime = compute_chf_dryout_state(
+            x_loc=x_loc,
+            G=G_loc,
+            Dh_i=float(Dh[i]),
+            rho_l=float(rhoL_loc),
+            rho_v=float(rhoV_loc),
+            mu_l=float(muL),
+            h_fg=float(max(hfg_loc, EPS)),
+            sigma=float(max(sigma_loc, EPS)),
+            q_flux_dem=float(q_flux_dem),
+        )
+        Nu_eff = max(NU_POST_DRYOUT_MIN, NU_BASE * nu_scale)
         hb = Nu_eff * k_mix / (Dh[i] + EPS)
 
         if i < rtd2:
@@ -615,7 +674,14 @@ def plant_step_transient(
             zone = "none"
 
         A_ex_i = float(Perim[i] * dx)
-        Qdot_f_i = max(0.0, hb * (Tw_loc - float(T_i)) * A_ex_i)
+        Qdot_nom_i = max(0.0, hb * (Tw_loc - float(T_i)) * A_ex_i)
+        Qdot_chf_cap_i = max(0.0, q_chf * A_ex_i)
+        Qdot_f_i = min(Qdot_nom_i, Qdot_chf_cap_i)
+
+        if regime == "post_dryout":
+            post_dryout_cells += 1
+        if Qdot_f_i + 1e-12 < Qdot_nom_i:
+            chf_limited_cells += 1
 
         if zone == "pre":
             Qdot_f_pre_sum += Qdot_f_i
@@ -654,6 +720,8 @@ def plant_step_transient(
         "main_qconv": float(Qdot_f_main_sum),
         "pre_qavail": float(pre_available),
         "main_qavail": float(main_available),
+        "chf_limited_cells": int(chf_limited_cells),
+        "post_dryout_cells": int(post_dryout_cells),
     }
 
     return h_new, p_new, T_fl, T_w, Tw_pre_next, Tw_main_next, conv_diag
@@ -738,6 +806,8 @@ def main():
     dt_hist = np.zeros(n_steps)
     conv_overdraw_pre_hist = np.zeros(n_steps)
     conv_overdraw_main_hist = np.zeros(n_steps)
+    chf_limited_cells_hist = np.zeros(n_steps)
+    post_dryout_cells_hist = np.zeros(n_steps)
 
     SP2_f = float(setpoint_rtd2(0.0))
     SP3_f = float(setpoint_rtd3(0.0))
@@ -852,6 +922,8 @@ def main():
 
         conv_overdraw_pre_hist[k] = max(0.0, conv_diag["pre_qconv"] - conv_diag["pre_qavail"])
         conv_overdraw_main_hist[k] = max(0.0, conv_diag["main_qconv"] - conv_diag["main_qavail"])
+        chf_limited_cells_hist[k] = conv_diag["chf_limited_cells"]
+        post_dryout_cells_hist[k] = conv_diag["post_dryout_cells"]
 
         if e2 > deadband:
             d_pre_cmd_next = float(np.clip(u2, 0.0, 1.0))
