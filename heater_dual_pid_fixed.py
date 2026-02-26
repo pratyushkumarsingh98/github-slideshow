@@ -61,7 +61,9 @@ def rate_limit(prev_cmd, cmd_target, slew_rate_w_per_s, dt):
 # =============================================================================
 # USER SWITCHES
 # =============================================================================
-FIXED_DT = 0.01
+FIXED_DT = 0.01  # treated as dt_max in adaptive-CFL stepping
+CFL_TARGET = 0.7
+DT_MIN = 1e-4
 SUPERVISOR_ON = False
 PRINT_EVERY = 100
 SP_FILTER_TAU = 1.5            # [s] setpoint prefilter time constant
@@ -315,6 +317,25 @@ def zone_losses(Tw_zone, A_zone):
         + 0.001 * calculation_P_cond_struct(k_Si, Tw_zone, T_ambient, A_zone, L_ext)
     )
     return float(max(losses, 0.0))
+
+
+def estimate_representative_velocity(h, p, A_cs, mass_flow, specie):
+    """Estimate representative channel velocity for adaptive-CFL dt selection."""
+    vmax = 0.0
+    for i in range(1, len(h)):
+        p_i = float(max(p[i], 1e3))
+        h_i = float(h[i])
+        try:
+            rho_i = float(CP.PropsSI("D", "P", p_i, "H", h_i, specie))
+        except Exception:
+            hL = CP.PropsSI("H", "P", p_i, "Q", 0, specie)
+            hV = CP.PropsSI("H", "P", p_i, "Q", 1, specie)
+            h_eval = float(np.clip(h_i, hL - 8e4, hV + 8e4))
+            rho_i = float(CP.PropsSI("D", "P", p_i, "H", h_eval, specie))
+        v_i = mass_flow / (max(rho_i, EPS) * max(float(A_cs[i]), EPS))
+        if v_i > vmax:
+            vmax = v_i
+    return float(max(vmax, EPS))
 
 
 def robust_temperature_from_ph(p_val, h_val, specie):
@@ -573,7 +594,7 @@ def plant_step_transient(
         p_new[i] = float(max(p_new[i - 1] - dp, 1e3))
 
         x_loc = float(np.clip(quality_from_hP(h_eval, p_i, specie, clip=False), 0.0, 1.0))
-        if x_loc >= X_DRYOUT_ONSET:
+        if 0.0 < x_loc < 1.0 and x_loc >= X_DRYOUT_ONSET:
             dryout_frac = (x_loc - X_DRYOUT_ONSET) / max(1.0 - X_DRYOUT_ONSET, EPS)
             dryout_frac = float(np.clip(dryout_frac, 0.0, 1.0))
             Nu_eff = NU_BASE * (1.0 - DRYOUT_NU_DROP_MAX * dryout_frac)
@@ -613,13 +634,29 @@ def plant_step_transient(
         else:
             T_w[i] = float(T_new)
 
+    pre_zone_mask = slice(1, max(rtd2, 1))
+    main_zone_mask = slice(max(rtd2, 1), max(rtd3, rtd2 + 1))
+    Tref_pre = float(np.mean(T_fl[pre_zone_mask])) if (max(rtd2, 1) - 1) > 0 else float(T_inlet)
+    main_fallback_idx = min(max(rtd2, 1), n - 1)
+    Tref_main = float(np.mean(T_fl[main_zone_mask])) if (max(rtd3, rtd2 + 1) - max(rtd2, 1)) > 0 else float(T_fl[main_fallback_idx])
+
+    pre_available = max(P_pre_net, 0.0) + max(Cw_pre, EPS) * max(Tw_pre_zone - Tref_pre, 0.0) / max(dt_fixed, EPS)
+    main_available = max(P_main_net, 0.0) + max(Cw_main, EPS) * max(Tw_main_zone - Tref_main, 0.0) / max(dt_fixed, EPS)
+
     Tw_pre_next = float(Tw_pre_zone + dt_fixed * (max(P_pre_net, 0.0) - Qdot_f_pre_sum) / max(Cw_pre, EPS))
     Tw_main_next = float(Tw_main_zone + dt_fixed * (max(P_main_net, 0.0) - Qdot_f_main_sum) / max(Cw_main, EPS))
 
     T_fl[0] = T_inlet
     T_w[0] = Tw_pre_next
 
-    return h_new, p_new, T_fl, T_w, Tw_pre_next, Tw_main_next
+    conv_diag = {
+        "pre_qconv": float(Qdot_f_pre_sum),
+        "main_qconv": float(Qdot_f_main_sum),
+        "pre_qavail": float(pre_available),
+        "main_qavail": float(main_available),
+    }
+
+    return h_new, p_new, T_fl, T_w, Tw_pre_next, Tw_main_next, conv_diag
 
 
 # =============================================================================
@@ -698,15 +735,23 @@ def main():
     Isp_act = np.zeros(n_steps)
     Ptot_cmd_before_losses_hist = np.zeros(n_steps)
     Ptot_applied_hist = np.zeros(n_steps)
+    dt_hist = np.zeros(n_steps)
+    conv_overdraw_pre_hist = np.zeros(n_steps)
+    conv_overdraw_main_hist = np.zeros(n_steps)
 
     SP2_f = float(setpoint_rtd2(0.0))
     SP3_f = float(setpoint_rtd3(0.0))
     Ppre_cmd_prev = 0.0
     Pmain_cmd_prev = 0.0
 
+    t = 0.0
     for k in tqdm(range(1, n_steps), desc="Simulating", dynamic_ncols=True):
-        t = k * FIXED_DT
+        v_rep = estimate_representative_velocity(h, p, Acs, mass_flow, specie)
+        dt_step = float(np.clip(CFL_TARGET * dx / (v_rep + EPS), DT_MIN, FIXED_DT))
+
+        t += dt_step
         time[k] = t
+        dt_hist[k] = dt_step
 
         # paper-style net power: subtract losses before thermal update
         losses_pre_now = zone_losses(Tw_pre_zone, A_pre)
@@ -714,7 +759,7 @@ def main():
         Ppre_net_now = max(Ppre_applied - losses_pre_now, 0.0)
         Pmain_net_now = max(Pmain_applied - losses_main_now, 0.0)
 
-        h, p, T_fl, T_wall, Tw_pre_zone, Tw_main_zone = plant_step_transient(
+        h, p, T_fl, T_wall, Tw_pre_zone, Tw_main_zone, conv_diag = plant_step_transient(
             h,
             p,
             xg,
@@ -732,7 +777,7 @@ def main():
             mass_flow,
             Ppre_net_now,
             Pmain_net_now,
-            FIXED_DT,
+            dt_step,
             Tw_pre_zone,
             Tw_main_zone,
             WALL_CAP_PRE_J_PER_K,
@@ -745,8 +790,8 @@ def main():
         Tw3 = float(T_wall[rtd3])
 
         prev_idx = max(k - 1, 0)
-        dT2_dt = (T2 - T2_hist[prev_idx]) / FIXED_DT if k > 1 else 0.0
-        dT3_dt = (T3 - T3_hist[prev_idx]) / FIXED_DT if k > 1 else 0.0
+        dT2_dt = (T2 - T2_hist[prev_idx]) / dt_step if k > 1 else 0.0
+        dT3_dt = (T3 - T3_hist[prev_idx]) / dt_step if k > 1 else 0.0
 
         T0 = float(T3)
         P0 = float(p[rtd3])
@@ -780,8 +825,8 @@ def main():
 
         SP2 = float(setpoint_rtd2(t))
         SP3 = float(setpoint_rtd3(t))
-        SP2_f = low_pass_setpoint(SP2_f, SP2, FIXED_DT, SP_FILTER_TAU)
-        SP3_f = low_pass_setpoint(SP3_f, SP3, FIXED_DT, SP_FILTER_TAU)
+        SP2_f = low_pass_setpoint(SP2_f, SP2, dt_step, SP_FILTER_TAU)
+        SP3_f = low_pass_setpoint(SP3_f, SP3, dt_step, SP_FILTER_TAU)
         SP2_hist[k] = SP2
         SP3_hist[k] = SP3
         SP2_f_hist[k] = SP2_f
@@ -790,8 +835,8 @@ def main():
         e2 = SP2_f - T2
         e3 = SP3_f - T3
 
-        u2 = float(pid2.update(T2, SP2_f, FIXED_DT))
-        u3 = float(pid3.update(T3, SP3_f, FIXED_DT))
+        u2 = float(pid2.update(T2, SP2_f, dt_step))
+        u3 = float(pid3.update(T3, SP3_f, dt_step))
         u2_raw[k] = u2
         u3_raw[k] = u3
 
@@ -802,21 +847,11 @@ def main():
         kp2_hist[k], ki2_hist[k], kd2_hist[k] = pid2.kp, pid2.ki, pid2.kd
         kp3_hist[k], ki3_hist[k], kd3_hist[k] = pid3.kp, pid3.ki, pid3.kd
 
-        Tw_pre = float(np.mean(T_wall[: max(rtd2, 1)]))
-        Tw_main = float(np.mean(T_wall[rtd2 : max(rtd3, rtd2 + 1)]))
+        losses_pre = losses_pre_now
+        losses_main = losses_main_now
 
-        losses_pre = (
-            calculation_P_rad(Tw_pre, T_ambient, em, sigma_stef_boltz, A_pre)
-            + calculation_P_conv(h_conv_ext, Tw_pre, T_ambient, A_pre)
-            + 0.001 * calculation_P_cond_struct(k_Si, Tw_pre, T_ambient, A_pre, L_ext)
-        )
-        losses_main = (
-            calculation_P_rad(Tw_main, T_ambient, em, sigma_stef_boltz, A_main)
-            + calculation_P_conv(h_conv_ext, Tw_main, T_ambient, A_main)
-            + 0.001 * calculation_P_cond_struct(k_Si, Tw_main, T_ambient, A_main, L_ext)
-        )
-        losses_pre = float(max(losses_pre, 0.0))
-        losses_main = float(max(losses_main, 0.0))
+        conv_overdraw_pre_hist[k] = max(0.0, conv_diag["pre_qconv"] - conv_diag["pre_qavail"])
+        conv_overdraw_main_hist[k] = max(0.0, conv_diag["main_qconv"] - conv_diag["main_qavail"])
 
         if e2 > deadband:
             d_pre_cmd_next = float(np.clip(u2, 0.0, 1.0))
@@ -869,8 +904,8 @@ def main():
             if T3 >= (SP3_f + MAIN_HARD_CUTOFF_K):
                 Pmain_cmd_next = 0.0
 
-        Ppre_cmd_next = rate_limit(Ppre_cmd_prev, Ppre_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
-        Pmain_cmd_next = rate_limit(Pmain_cmd_prev, Pmain_cmd_next, CMD_RATE_LIMIT_W_PER_S, FIXED_DT)
+        Ppre_cmd_next = rate_limit(Ppre_cmd_prev, Ppre_cmd_next, CMD_RATE_LIMIT_W_PER_S, dt_step)
+        Pmain_cmd_next = rate_limit(Pmain_cmd_prev, Pmain_cmd_next, CMD_RATE_LIMIT_W_PER_S, dt_step)
         Ppre_cmd_prev = Ppre_cmd_next
         Pmain_cmd_prev = Pmain_cmd_next
 
@@ -887,7 +922,7 @@ def main():
         d_main = duty_from_power(Pmain_cmd_next, _Pmax_main)
 
         # Commands computed at time k are applied at k+1 (ZOH).
-        t_next = t + FIXED_DT
+        t_next = t + dt_step
         if ACTUATION_MODE.lower() == "pwm":
             g_pre = pwm_gate(t_next, d_pre, PWM_PERIOD)
             g_main = pwm_gate(t_next, d_main, PWM_PERIOD)
@@ -902,7 +937,7 @@ def main():
 
         if PRINT_EVERY and (k % PRINT_EVERY == 0 or k == n_steps - 1):
             print(
-                f"k={k:5d} t={t:8.3f}s dt={FIXED_DT:0.4f}s | "
+                f"k={k:5d} t={t:8.3f}s dt={dt_step:0.4f}s | "
                 f"SP2={SP2:7.2f}K T2_fl={T2:7.2f}K T2_w={Tw2:7.2f}K e2={e2:8.2f} | "
                 f"SP3={SP3:7.2f}K T3_fl={T3:7.2f}K T3_w={Tw3:7.2f}K e3={e3:8.2f} | "
                 f"u2_raw(duty)={u2:7.3f} u3_raw(duty)={u3:7.3f} | "
